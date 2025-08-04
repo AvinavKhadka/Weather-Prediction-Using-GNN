@@ -1,0 +1,150 @@
+import torch
+import pandas as pd
+import json
+from torch_geometric.nn import GCNConv, BatchNorm
+from torch.nn import GRU
+import torch.nn.functional as F
+
+# Define the device (CPU or GPU)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Define the STGNN model architecture
+class STGNN(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.2):
+        super(STGNN, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+
+        # Spatial layers (GCN)
+        self.spatial_conv1 = GCNConv(input_dim, hidden_dim)
+        self.bn1 = BatchNorm(hidden_dim)
+        self.spatial_conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.bn2 = BatchNorm(hidden_dim)
+
+        # Temporal layer (GRU)
+        self.temporal_rnn = GRU(hidden_dim, hidden_dim, batch_first=True)
+
+        # Final prediction layer
+        self.fc = torch.nn.Linear(hidden_dim, output_dim * 3)  # Predict 3 days at once
+
+        # Dropout for regularization
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+    def forward(self, x, edge_index, batch_size, sequence_length):
+        # Reshape input for temporal modeling: (batch_size, sequence_length, num_nodes, input_dim)
+        if x.dim() == 3:
+            x = x.unsqueeze(2).expand(-1, -1, num_nodes, -1)
+
+        if x.size(1) != sequence_length or x.size(2) != num_nodes or x.size(3) != self.input_dim:
+            raise ValueError(f"Input tensor shape {x.shape} does not match expected shape [batch_size, sequence_length, num_nodes, input_dim]")
+
+        # Process each time step
+        temporal_outputs = []
+        for t in range(sequence_length):
+            # Spatial aggregation for time step t
+            x_t = x[:, t, :, :]  # (batch_size, num_nodes, input_dim)
+            x_t = x_t.reshape(-1, x_t.size(2))  # (batch_size * num_nodes, input_dim)
+
+            # First spatial layer
+            x_t = self.spatial_conv1(x_t, edge_index)
+            x_t = self.bn1(x_t)
+            x_t = F.relu(x_t)
+            x_t = self.dropout(x_t)
+
+            # Second spatial layer
+            x_t = self.spatial_conv2(x_t, edge_index)
+            x_t = self.bn2(x_t)
+            x_t = F.relu(x_t)
+            x_t = self.dropout(x_t)
+
+            # Reshape back to (batch_size, num_nodes, hidden_dim)
+            x_t = x_t.reshape(batch_size, -1, x_t.size(1))
+            temporal_outputs.append(x_t)
+
+        # Stack temporal outputs: (batch_size, sequence_length, num_nodes, hidden_dim)
+        temporal_outputs = torch.stack(temporal_outputs, dim=1)
+
+        # Reshape for GRU: (batch_size * num_nodes, sequence_length, hidden_dim)
+        temporal_outputs = temporal_outputs.permute(0, 2, 1, 3).contiguous()
+        temporal_outputs = temporal_outputs.reshape(-1, sequence_length, temporal_outputs.size(3))
+
+        # Temporal modeling with GRU
+        _, h_n = self.temporal_rnn(temporal_outputs)  # h_n: (1, batch_size * num_nodes, hidden_dim)
+        h_n = h_n.squeeze(0)  # (batch_size * num_nodes, hidden_dim)
+
+        # Final prediction layer (predict 3 days at once)
+        predictions = self.fc(h_n)  # (batch_size * num_nodes, output_dim * 3)
+        predictions = predictions.view(batch_size * num_nodes, 3, -1)  # Reshape to [batch_size * num_nodes, 3, output_dim]
+
+        return predictions, None  # Mask is not needed for inference
+
+# Load the checkpoint
+checkpoint_path = r"C:\Users\LENOVO\Desktop\semproject\latest_checkpoint.pt"
+checkpoint = torch.load(checkpoint_path, map_location=device)
+
+# Load the model architecture and parameters
+input_dim = checkpoint['input_dim']
+hidden_dim = checkpoint['hidden_dim']
+output_dim = checkpoint['output_dim']
+dropout_rate = checkpoint['dropout_rate']
+model = STGNN(input_dim, hidden_dim, output_dim, dropout_rate).to(device)
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()  # Set the model to evaluation mode
+
+# Load other necessary parameters
+edge_index = checkpoint['edge_index'].to(device)
+node_indices = checkpoint['node_indices']
+num_nodes = checkpoint['num_nodes']
+sequence_length = checkpoint['sequence_length']
+location_to_node = checkpoint['location_to_node']
+node_to_attrs = checkpoint['node_to_attrs']
+
+# Load the weather data
+weather_csv_path = r"C:\Users\LENOVO\Desktop\semproject\merged_weather_locations_cleaned_2.csv"
+weather_df = pd.read_csv(weather_csv_path)
+
+# Convert date to datetime and ensure correct format
+weather_df['date'] = pd.to_datetime(weather_df['date'], format='%Y-%m-%d')
+weather_df = weather_df.sort_values(by='date')
+
+# Add temporal features (day of the year, month)
+weather_df['day_of_year'] = weather_df['date'].dt.dayofyear
+weather_df['month'] = weather_df['date'].dt.month
+
+# Get the last sequence_length days of data
+last_sequence = weather_df.tail(sequence_length)
+
+# Prepare the input features for the last sequence
+input_features = []
+for _, row in last_sequence.iterrows():
+    location = row['Location_x'].strip().lower()
+    if location in location_to_node:
+        node_id = location_to_node[location]
+        lat = node_to_attrs[node_id]['latitude']
+        lon = node_to_attrs[node_id]['longitude']
+        features = [lat, lon, row['day_of_year'], row['month'], row['mean_2m_air_temperature'], row['relative_humidity'], row['total_precipitation']]
+        input_features.append(features)
+
+# Convert to tensor and add batch dimension
+input_features = torch.tensor(input_features, dtype=torch.float).unsqueeze(0).to(device)
+
+# Perform inference for the next 3 days
+with torch.no_grad():
+    predictions, _ = model(input_features, edge_index, batch_size=1, sequence_length=sequence_length)
+
+# Reshape predictions to match the expected output shape
+predictions = predictions.view(num_nodes, 3, -1).cpu().numpy()  # Reshape to [num_nodes, 3, output_dim]
+
+# Map predictions back to locations
+predicted_values = {}
+for node_id, idx in node_indices.items():
+    location = node_to_attrs[node_id]['location']
+    predicted_values[location] = predictions[idx].tolist()  # Convert numpy array to list for JSON serialization
+
+# Save predictions to a JSON file
+with open('predictions.json', 'w') as f:
+    json.dump(predicted_values, f, indent=4)
+
+print("Predictions saved to predictions.json")
